@@ -1,6 +1,6 @@
 const path = require("path");
 const { ethers } = require("ethers");
-const evm = require('web3connectjs');
+const evm = require("web3connectjs");
 const Dashboard = require("./ui/Dashboard");
 const SwapService = require("./services/SwapService");
 const StakingService = require("./services/StakingService");
@@ -14,6 +14,7 @@ const DeployService = require("./services/DeployService");
 const KitsuService = require("./services/KitsuService");
 const config = require(path.join(__dirname, "./config/config.json"));
 const Utils = require("./lib/utils");
+const telegram = require("./telegram");
 
 class Application {
   constructor(privateKey) {
@@ -44,7 +45,6 @@ class Application {
       this.dashboard.updateTable([
         ["Initializing...", "Pending", new Date().toLocaleTimeString()],
       ]);
-
       this.dashboard.updateLog("Initializing services...");
       this.dashboard.updateStatus("Initializing");
 
@@ -66,10 +66,7 @@ class Application {
       this.dashboard.setCycles(0, config.cycles.default);
 
       const services = {
-        sendTx: {
-          name: "SendTx",
-          service: SendTxService,
-        },
+        sendTx: { name: "SendTx", service: SendTxService },
         deploy: { name: "Deploy", service: DeployService },
         monorail: { name: "Monorail", service: MonorailService, address: config.contracts.monorail.router },
         rubicSwap: { name: "Rubic Swap", service: SwapService },
@@ -97,18 +94,16 @@ class Application {
         kitsu: {
           name: "Kitsu",
           service: KitsuService,
-          address: config.contracts.kitsu.router 
+          address: config.contracts.kitsu.router,
         },
       };
 
       for (const [key, info] of Object.entries(services)) {
         this.dashboard.updateLog(`Initializing ${info.name}...`);
         try {
-          if (info.address) {
-            this.services[key] = new info.service(info.address, wallet);
-          } else {
-            this.services[key] = new info.service(wallet);
-          }
+          this.services[key] = info.address
+            ? new info.service(info.address, wallet)
+            : new info.service(wallet);
           await this.services[key].initialize();
           this.dashboard.updateLog(`${info.name} initialized successfully`);
         } catch (error) {
@@ -134,7 +129,9 @@ class Application {
 
   async start() {
     try {
-      this.dashboard.updateLog(`Starting Monad Bot for wallet: ${Utils.maskedWallet(this.walletAddress)}`);
+      const masked = Utils.maskedWallet(this.walletAddress);
+      this.dashboard.updateLog(`Starting Monad Bot for wallet: ${masked}`);
+      await telegram.sendMessage(`🚀 Starting Monad Bot for wallet: \`${masked}\``);
 
       const initialized = await this.initialize();
       if (!initialized) {
@@ -142,6 +139,7 @@ class Application {
       }
 
       this.dashboard.updateLog("All services initialized. Starting cycles...");
+      await telegram.sendMessage(`✅ Services initialized for \`${masked}\`. Starting cycles...`);
 
       for (let i = 0; i < config.cycles.default; i++) {
         this.cycleCount++;
@@ -152,18 +150,19 @@ class Application {
 
         if (i < config.cycles.default - 1) {
           const delay = Utils.getRandomDelay();
-          this.dashboard.updateLog(
-            `Waiting ${delay / 1000} seconds before next cycle...`
-          );
+          this.dashboard.updateLog(`Waiting ${delay / 1000} seconds before next cycle...`);
           await Utils.delay(delay);
         }
       }
 
-      this.dashboard.updateLog(`Completed cycles for wallet: ${Utils.maskedWallet(this.walletAddress)}`);
+      this.dashboard.updateLog(`✅ Completed all cycles for: ${masked}`);
+      await telegram.sendMessage(`✅ Completed all cycles for \`${masked}\``);
       return true;
     } catch (error) {
-      this.dashboard.updateLog(`Fatal error for wallet ${Utils.maskedWallet(this.walletAddress)}: ${error.message}`);
+      const msg = `❌ Fatal error for wallet ${Utils.maskedWallet(this.walletAddress)}: ${error.message}`;
+      this.dashboard.updateLog(msg);
       this.dashboard.updateStatus("Error");
+      await telegram.sendMessage(msg);
       return false;
     }
   }
@@ -174,137 +173,77 @@ class Application {
       this.dashboard.setCycles(this.cycleCount, config.cycles.default);
 
       const formattedAmount = parseFloat(ethers.formatEther(amount)).toFixed(8);
-      this.dashboard.updateLog(`Starting cycle ${this.cycleCount} with ${formattedAmount} MON`);
+      const cycleMsg = `🔁 Cycle ${this.cycleCount} | Amount: ${formattedAmount} MON`;
+      this.dashboard.updateLog(cycleMsg);
+      await telegram.sendMessage(cycleMsg);
 
       this.transactionHistory.push({
         time: new Date().toLocaleTimeString(),
         amount: formattedAmount,
       });
-      if (this.transactionHistory.length > 10) {
-        this.transactionHistory.shift();
-      }
+      if (this.transactionHistory.length > 10) this.transactionHistory.shift();
       this.dashboard.updateLineChart(this.transactionHistory);
 
       const serviceStatus = [];
 
       for (const [name, service] of Object.entries(this.services)) {
         try {
+          const logPrefix = `${name}:`;
+          serviceStatus.push([name, "Running", new Date().toLocaleTimeString()]);
+          this.dashboard.updateTable(serviceStatus);
+
           if (name === "beanSwap") {
-            serviceStatus.push([name, "Running", new Date().toLocaleTimeString()]);
-            this.dashboard.updateTable(serviceStatus);
-
-            const wrapResult = await service.wrapMON(amount);
-            this.dashboard.updateLog(`${name}: Converted MON to USDC - ${wrapResult.status}`);
-
+            const wrap = await service.wrapMON(amount);
+            this.dashboard.updateLog(`${logPrefix} Wrapped MON -> USDC: ${wrap.status}`);
             await Utils.delay(Utils.getRandomDelay());
 
-            const unwrapResult = await service.unwrapMON();
-            this.dashboard.updateLog(`${name}: Converted USDC to MON - ${unwrapResult.status}`);
-
-            serviceStatus.pop();
-            serviceStatus.push([name, "Active", new Date().toLocaleTimeString()]);
+            const unwrap = await service.unwrapMON();
+            this.dashboard.updateLog(`${logPrefix} Unwrapped USDC -> MON: ${unwrap.status}`);
           } else if (service instanceof SwapService) {
-            serviceStatus.push([name, "Running", new Date().toLocaleTimeString()]);
-            this.dashboard.updateTable(serviceStatus);
-
-            const wrapResult = await service.wrapMON(amount);
-            this.dashboard.updateLog(`${name}: Wrapped MON - ${wrapResult.status}`);
-
+            const wrap = await service.wrapMON(amount);
+            this.dashboard.updateLog(`${logPrefix} Wrapped MON: ${wrap.status}`);
             await Utils.delay(Utils.getRandomDelay());
 
-            const unwrapResult = await service.unwrapMON(amount);
-            this.dashboard.updateLog(`${name}: Unwrapped MON - ${unwrapResult.status}`);
-
-            serviceStatus.pop();
-            serviceStatus.push([name, "Active", new Date().toLocaleTimeString()]);
+            const unwrap = await service.unwrapMON(amount);
+            this.dashboard.updateLog(`${logPrefix} Unwrapped MON: ${unwrap.status}`);
           } else if (typeof service.stakeaPriori === "function") {
-            serviceStatus.push([name, "Running", new Date().toLocaleTimeString()]);
-            this.dashboard.updateTable(serviceStatus);
-
-            const stakePriResult = await service.stakeaPriori(amount);
-            this.dashboard.updateLog(`${name}: aPriori Staked MON - ${stakePriResult.status}`);
-
-            serviceStatus.pop();
-            serviceStatus.push([name, "Active", new Date().toLocaleTimeString()]);
+            const stake = await service.stakeaPriori(amount);
+            this.dashboard.updateLog(`${logPrefix} aPriori Stake: ${stake.status}`);
           } else if (typeof service.stake === "function" && typeof service.unstake === "function") {
-            serviceStatus.push([name, "Running", new Date().toLocaleTimeString()]);
-            this.dashboard.updateTable(serviceStatus);
-
-            const stakeResult = await service.stake(amount);
-            this.dashboard.updateLog(`${name}: Staked MON - ${stakeResult.status}`);
-
+            const stake = await service.stake(amount);
+            this.dashboard.updateLog(`${logPrefix} Stake: ${stake.status}`);
             await Utils.delay(Utils.getRandomDelay());
 
-            const unstakeResult = await service.unstake(amount);
-            this.dashboard.updateLog(`${name}: Unstaked MON - ${unstakeResult.status}`);
-
-            serviceStatus.pop();
-            serviceStatus.push([name, "Active", new Date().toLocaleTimeString()]);
+            const unstake = await service.unstake(amount);
+            this.dashboard.updateLog(`${logPrefix} Unstake: ${unstake.status}`);
           } else if (name === "uniswap") {
-            serviceStatus.push([name, "Running", new Date().toLocaleTimeString()]);
-            this.dashboard.updateTable(serviceStatus);
-
             const tokenSymbols = Object.keys(config.contracts.uniswap.tokens);
-            const tokenSymbol = tokenSymbols[Math.floor(Math.random() * tokenSymbols.length)];
-
-            const swapEthResult = await service.swapEthForTokens(tokenSymbol, amount);
-            this.dashboard.updateLog(`uniswap: Swap MON -> ${tokenSymbol} => ${swapEthResult.status}`);
-
+            const symbol = tokenSymbols[Math.floor(Math.random() * tokenSymbols.length)];
+            const swap1 = await service.swapEthForTokens(symbol, amount);
+            this.dashboard.updateLog(`${logPrefix} MON -> ${symbol}: ${swap1.status}`);
             await Utils.delay(Utils.getRandomDelay());
 
-            const swapTokenResult = await service.swapTokensForEth(tokenSymbol);
-            this.dashboard.updateLog(`uniswap: Swap ${tokenSymbol} -> MON => ${swapTokenResult.status}`);
-
-            serviceStatus.pop();
-            serviceStatus.push([name, "Active", new Date().toLocaleTimeString()]);
+            const swap2 = await service.swapTokensForEth(symbol);
+            this.dashboard.updateLog(`${logPrefix} ${symbol} -> MON: ${swap2.status}`);
           } else if (name === "sendTx") {
-            serviceStatus.push([name, "Running", new Date().toLocaleTimeString()]);
-            this.dashboard.updateTable(serviceStatus);
-
-            const sendTxResult = await service.sendRandomTransaction();
-            this.dashboard.updateLog(`sendTx: Transaction sent => ${sendTxResult.status}`);
-
-            serviceStatus.pop();
-            serviceStatus.push([name, "Active", new Date().toLocaleTimeString()]);
+            const tx = await service.sendRandomTransaction();
+            this.dashboard.updateLog(`${logPrefix} Sent tx: ${tx.status}`);
           } else if (name === "monorail") {
-            serviceStatus.push([name, "Running", new Date().toLocaleTimeString()]);
-            this.dashboard.updateTable(serviceStatus);
-
-            const monorailResult = await service.sendTransaction();
-            this.dashboard.updateLog(`monorail: Transaction sent => ${monorailResult.status}`);
-
-            serviceStatus.pop();
-            serviceStatus.push([name, "Active", new Date().toLocaleTimeString()]);
+            const tx = await service.sendTransaction();
+            this.dashboard.updateLog(`${logPrefix} Monorail tx: ${tx.status}`);
           } else if (name === "deploy") {
-            serviceStatus.push([name, "Running", new Date().toLocaleTimeString()]);
-            this.dashboard.updateTable(serviceStatus);
-
-            const deployResult = await service.deployContracts(1);
-            if (deployResult && deployResult.length > 0) {
-              this.dashboard.updateLog(`Deploy contract: ${deployResult[0].status}`);
-            } else {
-              this.dashboard.updateLog("Deploy contract: Deployment result is empty");
-            }
-
-            serviceStatus.pop();
-            serviceStatus.push([name, "Active", new Date().toLocaleTimeString()]);
+            const deploy = await service.deployContracts(1);
+            const result = deploy?.[0]?.status || "No status";
+            this.dashboard.updateLog(`${logPrefix} Deploy contract: ${result}`);
           } else if (name === "kitsu") {
-            serviceStatus.push([name, "Running", new Date().toLocaleTimeString()]);
-            this.dashboard.updateTable(serviceStatus);
-      
-            const stakeKitsuResult = await service.stakeMON();
-            this.dashboard.updateLog(`${name}: Staked MON => ${stakeKitsuResult.status}`);
-      
-            // await Utils.delay(Utils.getRandomDelay());
-      
-            // const unstakeKitsuResult = await service.unstakeGMON();
-            // this.dashboard.updateLog(`${name}: Unstaked gMON => ${unstakeKitsuResult.status}`);
-      
-            serviceStatus.pop();
-            serviceStatus.push([name, "Active", new Date().toLocaleTimeString()]);
+            const kitsuStake = await service.stakeMON();
+            this.dashboard.updateLog(`${logPrefix} Stake MON => ${kitsuStake.status}`);
           }
-        } catch (error) {
-          this.dashboard.updateLog(`${name}: Error - ${error.message}`);
+
+          serviceStatus.pop();
+          serviceStatus.push([name, "Active", new Date().toLocaleTimeString()]);
+        } catch (err) {
+          this.dashboard.updateLog(`${name}: Error - ${err.message}`);
           serviceStatus.push([name, "Error", new Date().toLocaleTimeString()]);
         }
       }
@@ -315,8 +254,8 @@ class Application {
       this.dashboard.updateTokens(tokens);
 
       const balanceWei = await this.wallet.provider.getBalance(this.wallet.address);
-      const formattedBalanceUpdated = parseFloat(ethers.formatEther(balanceWei)).toFixed(4);
-      this.dashboard.updateBalance(formattedBalanceUpdated);
+      const formattedBalance = parseFloat(ethers.formatEther(balanceWei)).toFixed(4);
+      this.dashboard.updateBalance(formattedBalance);
     } catch (error) {
       this.dashboard.updateStatus("Error");
       this.dashboard.updateLog(`Cycle error: ${error.message}`);
@@ -335,17 +274,15 @@ if (require.main === module) {
 
   async function processWallets() {
     for (const key of privateKeys) {
-      console.log(`Processing wallet with private key: ${Utils.maskedWallet(key)}`);
       const app = new Application(key);
       const conn = await evm.connect(key);
       const success = await app.start();
       if (!success) {
-        console.error("Error processing wallet:", Utils.maskedWallet(key));
+        console.error("❌ Error processing wallet:", Utils.maskedWallet(key));
       }
-
       await Utils.delay(3000);
     }
-    console.log("All wallets processed.");
+    console.log("✅ All wallets processed.");
   }
 
   processWallets().catch((error) => {
